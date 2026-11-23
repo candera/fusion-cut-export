@@ -165,6 +165,12 @@ def align_to_longest_edge(part):
     return part.moved(rotation(-angle))
 
 
+def to_origin(parts):
+    """Shift all parts together so the lower left of the whole drawing is the origin."""
+    x0, y0, _, _ = merge_bounds(part.bounds() for part in parts)
+    return [part.moved(lambda x, y: (x - x0, y - y0)) for part in parts]
+
+
 def place_on_sheet(parts, sheet_width, spacing):
     """Pack parts left to right in rows, in the order given, with the lower left at the origin.
 

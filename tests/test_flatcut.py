@@ -69,6 +69,14 @@ class Geometry(unittest.TestCase):
         self.assertAlmostEqual(boxes[2][0], 0.0)                    # third wraps
         self.assertAlmostEqual(boxes[2][1] - boxes[0][3], 5.0)      # next row, 5 mm above
 
+    def test_to_origin_keeps_relative_positions(self):
+        a = rounded_plate(name="a").moved(fc.rotation(0, 300, 50))
+        b = rounded_plate(name="b").moved(fc.rotation(0, 450, 80))
+        moved = fc.to_origin([a, b])
+        self.assertEqual(moved[0].bounds()[:2], (0, 0))
+        self.assertAlmostEqual(moved[1].bounds()[0] - moved[0].bounds()[0], 150)
+        self.assertAlmostEqual(moved[1].bounds()[1] - moved[0].bounds()[1], 30)
+
     def test_part_wider_than_sheet_is_reported_not_dropped(self):
         placed, wide = fc.place_on_sheet([rounded_plate(name="big")], 50.0, 5.0)
         self.assertEqual(wide, ["big"])

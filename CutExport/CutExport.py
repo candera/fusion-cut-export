@@ -18,7 +18,9 @@ COMMAND_NAME = "Export Faces for Cutting"
 ICON_FOLDER = Path(__file__).resolve().parent / "Resources"
 VERSION = loads(Path(__file__).with_suffix(".manifest").read_text(encoding="utf-8"))["version"]
 CM_TO_MM = 10.0
+PARALLEL_TOLERANCE = 1e-5  # Allowed 1 - |cos| between face normals sharing a frame.
 STROKE_TOLERANCE_MM = 0.005  # Maximum chord error when a spline or ellipse becomes line segments.
+LAYOUTS = {"keep": "Keep arrangement", "rows": "Lay out in rows"}
 ORIENTATIONS = {"edge": "Align to longest edge", "view": "Keep face orientation"}
 handlers = []
 last_folder = []
@@ -30,9 +32,10 @@ class ExportError(Exception):
 
 @dataclass
 class Options:
-    align: bool
-    spacing: float      # mm
-    sheet_width: float  # mm
+    align: bool         # Rows layout only: turn each part so its longest edge is horizontal.
+    spacing: float      # mm, rows layout only
+    sheet_width: float  # mm, rows layout only
+    keep: bool = True   # Keep the faces where they are relative to each other.
 
 
 def require(result, message):
@@ -41,26 +44,54 @@ def require(result, message):
     return result
 
 
-def face_frame(face):
-    """Return a function mapping a world point (cm) to the face's outside view, in mm.
-
-    The face is flattened as seen from outside the body: x follows the plane's own
-    u direction and y completes a right-handed frame with the outward normal.
-    """
-    plane = require(core.Plane.cast(face.geometry), "Only planar faces can be exported.")
-    ok, normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
-    require(ok, "Could not read a face normal.")
-    normal.normalize()
-    u = plane.uDirection
-    u.subtract(_scaled(normal, u.dotProduct(normal)))
-    u.normalize()
-    v = normal.crossProduct(u)
-    origin = plane.origin
-
+def flattener(origin, u, v):
+    """Map a world point (cm) to coordinates (mm) along u and v from origin."""
     def flatten(point):
         d = origin.vectorTo(point)
         return d.dotProduct(u) * CM_TO_MM, d.dotProduct(v) * CM_TO_MM
-    return flatten, normal
+    return flatten
+
+
+def outward_normal(face):
+    ok, normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
+    require(ok, "Could not read a face normal.")
+    normal.normalize()
+    return normal
+
+
+def face_frame(face):
+    """A frame for one face: its outside view, x along the plane's own u direction.
+
+    Returns (flatten, normal). y completes a right-handed frame with the outward normal.
+    """
+    plane = require(core.Plane.cast(face.geometry), "Only planar faces can be exported.")
+    normal = outward_normal(face)
+    u = plane.uDirection
+    u.subtract(_scaled(normal, u.dotProduct(normal)))
+    u.normalize()
+    return flattener(plane.origin, u, normal.crossProduct(u)), normal
+
+
+def shared_frame(faces, names):
+    """One frame for every face, so their positions relative to each other are kept.
+
+    The view looks at the faces from the side their normals share, preferring +Z so that a
+    flat arrangement in the XY plane (such as Arrange makes) reads as seen from above. x and y
+    follow Fusion's standard views. A face on the far side of its part is drawn as seen
+    through the part, which is where its outline sits in the arrangement.
+    """
+    normals = [outward_normal(face) for face in faces]
+    view = normals[0].copy()
+    if abs(view.z) > 0.5 and view.z < 0:
+        view.scaleBy(-1)
+    for name, normal in zip(names, normals):
+        if abs(normal.dotProduct(view)) < 1 - PARALLEL_TOLERANCE:
+            raise ExportError(f"{name} is not parallel to the first face, so the arrangement cannot be kept. "
+                              "Select faces that lie flat in the same direction, or choose the row layout.")
+    up = core.Vector3D.create(0, 0, 1) if abs(view.z) < 1 - PARALLEL_TOLERANCE else core.Vector3D.create(0, 1, 0)
+    u = up.crossProduct(view)
+    u.normalize()
+    return flattener(faces[0].pointOnFace, u, view.crossProduct(u)), view
 
 
 def _scaled(vector, factor):
@@ -95,8 +126,8 @@ def edge_entity(edge, flatten, normal):
     return flatcut.Polyline([flatten(point) for point in points])
 
 
-def face_part(face, name):
-    flatten, normal = face_frame(face)
+def face_part(face, name, frame=None):
+    flatten, normal = frame or face_frame(face)
     loops = [flatcut.Loop(loop.isOuter, [edge_entity(edge, flatten, normal) for edge in loop.edges])
              for loop in face.loops]
     part = flatcut.Part(name, loops)
@@ -108,7 +139,8 @@ def face_part(face, name):
 
 def face_label(face, taken):
     body = face.body
-    base = f"{body.name} face"
+    owner = body.assemblyContext.name if body.assemblyContext else body.name  # Panels often share a body name.
+    base = f"{owner} face"
     index = 1
     while f"{base} {index}" in taken:
         index += 1
@@ -116,17 +148,19 @@ def face_label(face, taken):
 
 
 def build_parts(faces, options):
-    parts, names, seen = [], set(), set()
+    unique, names = [], []
     for face in faces:
-        token = face.entityToken
-        if token in seen:
-            continue
-        seen.add(token)
-        name = face_label(face, names)
-        names.add(name)
-        part = face_part(face, name)
-        parts.append(flatcut.align_to_longest_edge(part) if options.align else part)
-    require(parts, "Select at least one planar face.")
+        if face.entityToken not in {f.entityToken for f in unique}:
+            unique.append(face)
+            names.append(face_label(face, set(names)))
+    require(unique, "Select at least one planar face.")
+    if options.keep:
+        frame = shared_frame(unique, names)
+        parts = [face_part(face, name, frame) for face, name in zip(unique, names)]
+        return flatcut.to_origin(parts), []
+    parts = [face_part(face, name) for face, name in zip(unique, names)]
+    if options.align:
+        parts = [flatcut.align_to_longest_edge(part) for part in parts]
     return flatcut.place_on_sheet(parts, options.sheet_width, options.spacing)
 
 
@@ -159,14 +193,23 @@ def selected_faces(inputs):
 def settings(inputs):
     return Options(inputs.itemById("orientation").selectedItem.name == ORIENTATIONS["edge"],
                    inputs.itemById("spacing").value * CM_TO_MM,
-                   inputs.itemById("sheet").value * CM_TO_MM)
+                   inputs.itemById("sheet").value * CM_TO_MM,
+                   inputs.itemById("layout").selectedItem.name == LAYOUTS["keep"])
+
+
+def show_layout_inputs(inputs):
+    rows = inputs.itemById("layout").selectedItem.name == LAYOUTS["rows"]
+    for key in ("orientation", "spacing", "sheet"):
+        inputs.itemById(key).isVisible = rows
 
 
 class InputsChanged(core.InputChangedEventHandler):
     def notify(self, args):
-        if args.input.id not in ("faces", "orientation", "spacing", "sheet"):
+        if args.input.id not in ("faces", "layout", "orientation", "spacing", "sheet"):
             return
         inputs = args.inputs
+        if args.input.id == "layout":
+            show_layout_inputs(inputs)
         try:
             faces = selected_faces(inputs)
             message = "Select planar faces to cut." if not faces else describe(*build_parts(faces, settings(inputs)))
@@ -224,15 +267,19 @@ class Created(core.CommandCreatedEventHandler):
     def notify(self, args):
         command = args.command
         inputs = command.commandInputs
-        faces = inputs.addSelectionInput("faces", "Faces", "Pick the planar faces to cut, in the order to lay them out.")
+        faces = inputs.addSelectionInput("faces", "Faces", "Pick the planar faces to cut. In the row layout, the pick order is the layout order.")
         faces.addSelectionFilter("PlanarFaces")
         faces.setSelectionLimits(1, 0)
+        layout = inputs.addDropDownCommandInput("layout", "Layout", core.DropDownStyles.TextListDropDownStyle)
+        for key, label in LAYOUTS.items():
+            layout.listItems.add(label, key == "keep")
         orientation = inputs.addDropDownCommandInput("orientation", "Orientation",
                                                      core.DropDownStyles.TextListDropDownStyle)
         for key, label in ORIENTATIONS.items():
             orientation.listItems.add(label, key == "edge")
         inputs.addValueInput("spacing", "Spacing", "mm", core.ValueInput.createByString("5 mm"))
         inputs.addValueInput("sheet", "Sheet width", "mm", core.ValueInput.createByString("600 mm"))
+        show_layout_inputs(inputs)
         inputs.addTextBoxCommandInput("status", "", "Select planar faces to cut.", 8, True)
         local_handlers = [InputsChanged(), Execute()]
         command.inputChanged.add(local_handlers[0])
