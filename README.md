@@ -84,3 +84,7 @@ Run the command from the toolbar on a real design, import the DXF into the cutti
 - Intended cutters: Gweike M3 Pro (NexCut), Gweike 30 W galvo (LightBurn), Nova Labs CO2 lasers (RDWorks), and a CNC plasma cutter.
 - [Parametric Box Joint](https://github.com/candera/fusion-box-joints) — panels from that project are natural inputs.
 - Fusion API objects used: `BRepFace`, `BRepEdge`, `SurfaceEvaluator.getNormalAtPoint`, `CurveEvaluator3D.getStrokes`. The DXF output was checked with `ezdxf` rather than against Autodesk's specification text.
+
+## License
+
+[MIT](LICENSE)
